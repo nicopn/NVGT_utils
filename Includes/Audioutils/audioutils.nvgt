@@ -1,0 +1,561 @@
+/*
+Audioutils
+classes and functions for generating and manipulating audio data
+*/
+
+// constants
+const double pi = 3.1415926535897932384626433832795;
+
+enum audio_clip_mode {
+	AUDIO_CLIP_UNBOUNDED = 0,  // samples can go outside of the -1 to 1 range
+	AUDIO_CLIP_CLAMP,		  // samples will be hard-clamped to the -1 to 1 range
+	AUDIO_CLIP_RESCALE		 // if the audio clips, all samples will be scaled by a constant, such that the loudest is at either -1 or 1
+}
+
+// helper: clamp a value to a minimum and maximum
+double clamp(double value, double min, double max) {
+	value = value < min ? min : value;
+	value = value > max ? max : value;
+	return value;
+}
+
+// functions for working with sound objects
+/*
+funcdef double interpolator(double start, double end, double progress);
+function template for calculating the intermediate values given the start and end values and the progress to completion
+
+parameters:
+double start: The starting value
+double end: the end value
+double progress: The progress to completion of the interpolation, as a value from 0 to 1 inclusive.
+
+returns:
+the interpolated value
+
+remarks:
+If progress is at 0, the start value is returned. If it is at 1, the end value is returned. All other values within this range produce values between these two. Going outside these bounds is undefined
+*/
+funcdef double interpolator(double start, double end, double progress);
+
+/*
+_fade_lin, _fade_eqp, etc.
+Internal functions used with the fade_curves dictionary to interpolate between two values with different curves
+See Interpolator for a description of their signatures
+*/
+double _fade_lin(double s, double e, double t) {
+	return s + t * (e - s);
+}
+double _fade_eqp(double s, double e, double t) {
+	return sqrt(_fade_lin(s ** 2, e ** 2, t));
+}
+
+double _fade_exp(double s, double e, double t) {
+	return s + (e - s) * (1.0 - e **t);
+}
+/*
+dictionary fade_curves
+Maps strings (keys) to interpolation functions (values) for use with the fade function
+To add a fade curve to the dictionary, make a function compatible with the interpolator funcdef, and add it to this dictionary with a unique key
+*/
+dictionary fade_curves = {
+	{"lin",@ _fade_lin},
+	{"eqp",@ _fade_eqp},
+	{"exp",@ _fade_exp}
+};
+
+/*
+void fade(sound@ handle, double end volume, uint duration, string curve="exp")
+Fades a sound object to a given volume over a specified duration and with a given fade curve
+
+parameters:
+sound@ handle: Handle to the sound object to perform fading on
+double end_volume: The volume of the sound object at the end of the fade (DBFS)
+uint duration: How long the fade takes to complete (ms
+string curve: Describes the shape of the fade. This value will be looked up in the fade_curves dictionary, and an error message will be shown if it couldn't be found.
+
+*/
+void fade(sound@ handle, double end_volume, uint duration, string curve = "exp") {
+	double s = 10.0 **(double(handle.volume) / 20.0);
+	double e = 10.0 **(end_volume / 20.0);
+	interpolator@ c;
+	if (!fade_curves.exists(curve)) {
+		alert("Error", "fade curve " + curve + " could not be found");
+		handle.volume = end_volume;
+		return;
+	}
+	if (!fade_curves.get(curve,@ c)) {
+		alert("Error", curve + " fade curve could not be retrieved");
+		handle.volume = end_volume;
+		return;
+	}
+
+	timer t;
+	while (t.elapsed < duration) {
+		handle.volume = log10(c(s, e, double(t.elapsed) / double(duration))) * 20;
+		wait(5);
+	}
+}
+
+/*
+audio class
+Represents audio data stored in 32-bit float format and allows to manipulate it
+
+constructors:
+audio(uint samplerate=44100, uint channels=1)
+
+parameters:
+uint samplerate: Sampling rate of the sound in Hertz. Defaults to 44100
+uint channels: number of audio channels (1 for mono, 2 for stereo, etc). Defaults to 1 (mono)
+
+*/
+
+class audio {
+	float[] data();
+	uint samplerate = 44100;
+	uint channels = 1;
+	audio_clip_mode clip_mode = AUDIO_CLIP_UNBOUNDED;
+
+	audio(uint samplerate = 44100, uint channels = 1) {
+		this.samplerate = samplerate;
+		this.channels = channels;
+	}
+
+	/*
+	audio@ opAdd(audio@ other)
+	Concatenates the data of another audio object to this audio object, effectively making one play after the other.
+
+	parameters:
+	audio@ other: The audio object whose data will be concatenated to this audio object.
+
+	remarks:
+	This method overloads the + operator
+	This method does not account for a difference in sample rate or number of channels between the two objects. It will always use the first object to determine these propperties
+	*/
+
+	audio@ opAdd(audio@ other) {
+		audio a;
+		a.samplerate = this.samplerate;
+		a.channels = this.channels;
+		a.clip_mode = this.clip_mode;
+		a.data = this.data;
+		a.data.insert_last(other.data);
+		return @ a;
+	}
+
+	/*
+	audio@ opAssign(audio@ other)
+	Assigns the data, sample rate, number of channels, and clipping behavior from another audio object to this audio object.
+
+	parameters:
+	audio@ other: The audio object whose data, sample rate, number of channels, and clip mode will be copied.
+
+	returns:
+	audio@: a handle to the current audio object so that assignments can be chained
+	remarks:
+	This method overloads the = operator
+	*/
+	audio@ opAssign(audio@ other) {
+		this.data = other.data;
+		this.samplerate = other.samplerate;
+		this.channels = other.channels;
+		this.clip_mode = other.clip_mode;
+		return this;
+	}
+
+	/*
+	audio@ opAssign(float[]@ other)
+	Assigns audio data from an array of floats to this audio object.
+
+	parameters:
+	float[]@ other: The array of float values to be assigned as audio data.
+
+	returns:
+	audio@: a handle to the current audio object so that assignments can be chained
+
+	remarks:
+	This method overloads the = operator
+	The array of floats must contain one float per audio sample. If the signal has more than one channel, these will be interleaved.
+	*/
+
+	audio@ opAssign(float[]@ other) {
+		this.data.resize(0);
+		this.data.insert_last(other);
+		return this;
+	}
+	/*
+	audio@ opAssign(string other)
+	Assigns audio data from a binary string representation to this audio object.
+
+	parameters:
+	string other: The binary string containing audio data.
+
+	returns:
+	audio@: a handle to the current audio object so that assignments can be chained
+
+	remarks:
+	This method overloads the = operator
+	The binary string is expected to store one or more 32-bit IEEE 754 floats, one per sample. If the signal has more than one channel, these will be interleaved. No header or footer is needed. If there is one, it will be interpreted as audio data
+	*/
+
+	audio@ opAssign(string other) {
+		data.resize(0);
+		datastream ds(other);
+		ds.binary = true;
+		while (ds.good) {
+			data.insert_last(ds.read_float());
+		}
+		return this;
+	}
+
+	/*
+	uint length()
+	Returns the length of the audio in milliseconds.
+
+	returns:
+	uint: The length of the audio in milliseconds.
+	*/
+
+	uint length() {
+		return data.length() / (samplerate / 1000) / channels;
+	}
+	/*
+	uint64 length_samples()
+	Returns the length of the audio in samples.
+
+	returns:
+	uint64: The length of the audio in samples.
+	*/
+
+	uint64 length_samples() {
+		return data.length() / channels;
+	}
+
+	/*
+	string opImplConv()
+	Converts the audio data to a binary string representation.
+
+	returns:
+	string: A binary string representing the audio data.
+
+	remarks:
+	This method is automatically called when an audio object is converted to a string
+	See the remarks for opAssign(string other) for information about how the string is formatted.
+	*/
+
+	string opImplConv() {
+		datastream ds;
+		ds.binary = true;
+		for (uint i = 0; i < data.length(); i++) {
+			ds.write_float(data[i]);
+		}
+		return ds.str();
+	}
+
+	/*
+	audio@ opMul(audio@ other)
+	Combines the audio data of this audio object with another audio object by summing their samples, effectively making them play at the same time.
+
+	parameters:
+	audio@ other: The audio object whose samples will be summed with this audio object's samples.
+
+	returns:
+	audio@: A new audio object containing the combined sample data.
+
+	remarks:
+	this method overloads the * operator
+	Once summing is performed, clipping will be handled automatically according to the clip_mode propperty
+	This method does not account for a difference in sample rate or number of channels between the two objects. It will always use the first object to determine these propperties
+	*/
+
+	audio@ opMul(audio@ other) {
+		audio a;
+		a.samplerate = this.samplerate;
+		a.channels = this.channels;
+		a.clip_mode = this.clip_mode;
+		float[]@ shortest = data.length() <= other.data.length() ? this.data : other.data;
+		float[]@ longest=shortest is this.data ? other.data : this.data;
+
+		float[] sum;
+		sum.insert_last(longest);
+		for (uint i = 0; i < shortest.length(); i++) {
+			sum[i] += shortest[i];
+		}
+		a.data=sum;
+		a.handle_clipping();
+		return @ a;
+	}
+
+	/*
+	audio@ opMul(uint times)
+	Repeats the audio a given number of times
+	parameters:
+	uint times: Number of times to repeat
+
+	returns:
+	A handle to an audio object containing the repeated data
+	*/
+	audio@ opMul(uint times) {
+		audio a;
+		for(uint i=0; i<times; i++) {
+			a=a+this;
+		}
+		return @a;
+	}
+
+	/*
+	void gain(float amp)
+	Scales the entire audio data by a given factor, affecting the volume of the audio.
+
+	parameters:
+	float amp: The factor by which to scale the audio data. A negative value will invert the polarity of the samples.
+	*/
+
+	void gain(float amp) {
+		for (uint i = 0; i < data.length(); i++) {
+			data[i] *= amp;
+		}
+	}
+
+	/*
+	void handle_clipping()
+	Handles clipped audio samples based on the clipping mode set in the clip_mode property.
+	*/
+
+	void handle_clipping() {
+		switch (clip_mode) {
+			case AUDIO_CLIP_UNBOUNDED:
+				return;
+				break;
+
+			case AUDIO_CLIP_CLAMP:
+				for (uint i = 0; i < data.length(); i++) {
+					data[i] = clamp(data[i], -1, 1);
+				}
+				break;
+
+			case AUDIO_CLIP_RESCALE:
+				normalize(1.0, 1.0);
+				break;
+		}
+	}
+	/*
+	void normalize(float target, float threshold = 0)
+	Normalizes the audio data such that the loudest sample above the specified threshold is scaled to the target level.
+
+	parameters:
+	float target: The target level to which the loudest sample will be scaled.
+	float threshold: The minimum absolute value a sample must have to be considered for normalization. Default is 0, meaning all samples will be accounted for.
+	*/
+
+	void normalize(float target, float threshold = 0) {
+		float loudest = 0;
+		for (uint i = 0; i < data.length(); i++) {
+			if (abs(data[i]) >= threshold && abs(data[i]) > loudest) {
+				loudest = data[i];
+			}
+		}
+		gain(target / loudest);
+	}
+
+	/*
+	bool push(sound@ s, bool stream_end=true)
+	Pushes the audio data into a sound object for playback
+
+	parameters:
+	sound@ s: handle to the sound object to push the audio data to
+	bool stream_end=true: Whether this is the end of the audio stream or not. If you will push more audio data afterward, set this to true.
+	returns:
+	bool: true on success, false otherwise
+
+	remarks:
+	This will automatically convert the audio data to binary, and send the correct sample rate and number of channels.
+	*/
+
+	bool push(sound@ s, bool stream_end = true) { return s.push_memory(this, stream_end, samplerate, channels); }
+}
+
+/*
+Generators
+Functions that generate sound data
+*/
+
+/*
+audio@ sine_wave(float freq, float dur, float amp = 1.0, uint sr = 44100)
+Generates a sine wave with the specified parameters.
+
+parameters:
+float freq: Frequency of the sine wave in Hz
+float dur: Duration of the wave in milliseconds
+float amp: Amplitude of the wave (default: 1.0)
+uint sr: Sample rate in Hz (default: 44100)
+
+returns:
+audio@: A handle to an audio object containing the generated sine wave
+*/
+audio@ sinewave(float freq, float dur, float amp = 1.0, uint sr = 44100) {
+	audio a(sr, 1);
+	uint num_samples = (dur / 1000) * sr;
+	a.data.resize(num_samples);
+	double phi = 0.0;						 // phase accumulator
+	const double delta = 2 * pi * freq / sr;  // phase increment per sample
+	for (uint t = 0; t < num_samples; t++) {
+		a.data[t] = amp * sin(phi);
+		phi += delta;
+	}
+	return @ a;
+}
+
+/*
+audio@ silence(float dur, uint sr=44100)
+Generates silent audio for the specified duration.
+
+parameters:
+float dur: Duration of silence in milliseconds
+uint sr: Sample rate in Hz (default: 44100)
+
+returns:
+audio@: A handle to an audio object containing silence
+*/
+audio@ silence(float dur, uint sr = 44100) {
+	audio a(sr, 1);
+	uint num_samples = (dur / 1000) * sr;
+	a.data.resize(num_samples);
+	return @ a;
+}
+
+/*
+audio@ white_noise(float dur, float amp=1.0, float density=1.0, uint sr=44100, uint channels=1)
+Generates white noise with the specified parameters.
+
+parameters:
+float dur: Duration of the noise in milliseconds
+float amp: Amplitude of the noise (default: 1.0)
+float density: Density of the noise, between 0.0 and 1.0 (default: 1.0)
+uint sr: Sample rate in Hz (default: 44100)
+uint channels: Number of channels (default: 1)
+
+returns:
+audio@: A handle to an audio object containing the generated white noise
+*/
+audio@ white_noise(float dur, float amp = 1.0, float density = 1.0, uint sr = 44100, uint channels = 1) {
+	audio a(sr, channels);
+	density = float(clamp(density, 0.0, 1.0));
+	density /= 2;
+	density *= 100;
+	uint num_samples = (dur / 1000) * sr * channels;
+	a.data.reserve(num_samples);
+	for (uint i = 0; i < num_samples; i++) {
+		a.data.insert_last(random_bool(density) ? amp : 0);
+	}
+	return @ a;
+}
+
+/*
+audio@ saw_wave(float freq, float dur, float amp = 1.0, uint sr = 44100)
+Generates a sawtooth wave with the specified parameters.
+
+parameters:
+float freq: Frequency of the wave in Hz
+float dur: Duration of the wave in milliseconds
+float amp: Amplitude of the wave (default: 1.0)
+uint sr: Sample rate in Hz (default: 44100)
+
+returns:
+audio@: A handle to an audio object containing the generated sawtooth wave
+*/
+audio@ saw_wave(float freq, float dur, float amp = 1.0, uint sr = 44100) {
+	audio a(sr, 1);
+	uint num_samples = (dur / 1000) * sr;
+	a.data.resize(num_samples);
+	double period = sr / double(freq);
+	for (uint t = 0; t < num_samples; t++) {
+		a.data[t] = amp * (2.0 * ((t % uint(period)) / period) - 1.0);
+	}
+	return @ a;
+}
+
+/*
+audio@ dc_offset(float value, float dur, uint sr=44100)
+Generates a DC offset signal with the specified parameters.
+
+parameters:
+float value: The DC offset value
+float dur: Duration of the signal in milliseconds
+uint sr: Sample rate in Hz (default: 44100)
+
+returns:
+audio@: A handle to an audio object containing the DC offset signal
+*/
+audio@ dc_offset(float value, float dur, uint sr = 44100) {
+	audio a(sr, 1);
+	uint num_samples = (dur / 1000) * sr;
+	a.data.reserve(num_samples);
+	for (uint i = 0; i < num_samples; i++) {
+		a.data.insert_last(value);
+	}
+	return @ a;
+}
+
+/*
+audio@ pulse_wave(float freq, float dur, float pulse_width=0.5, float amp=1.0, uint sr=44100)
+Generates a pulse wave with the specified parameters.
+
+parameters:
+float freq: Frequency of the wave in Hz
+float dur: Duration of the wave in milliseconds
+float pulse_width: Width of the pulse, between 0.0 and 1.0 (default: 0.5)
+float amp: Amplitude of the wave (default: 1.0)
+uint sr: Sample rate in Hz (default: 44100)
+
+returns:
+audio@: A handle to an audio object containing the generated pulse wave
+*/
+audio@ pulse_wave(float freq, float dur, float pulse_width = 0.5, float amp = 1.0, uint sr = 44100) {
+	audio a(sr, 1);
+	uint num_samples = uint((dur / 1000.0) * sr);
+	a.data.resize(num_samples);
+	uint period = uint(sr / freq);
+	uint high_time = uint(period * pulse_width);
+
+	for (uint t = 0; t < num_samples; t++) {
+		if ((t % period) < high_time) {
+			a.data[t] = amp;
+		} else {
+			a.data[t] = 0;
+		}
+	}
+
+	return @ a;
+}
+
+/*
+audio@ triangle_wave(float freq, float dur, float amp=1.0, uint sr=44100)
+Generates a triangle wave with the specified parameters.
+
+parameters:
+float freq: Frequency of the wave in Hz
+float dur: Duration of the wave in milliseconds
+float amp: Amplitude of the wave (default: 1.0)
+uint sr: Sample rate in Hz (default: 44100)
+
+returns:
+audio@: A handle to an audio object containing the generated triangle wave
+*/
+audio@ triangle_wave(float freq, float dur, float amp = 1.0, uint sr = 44100) {
+	audio a(sr, 1);
+	uint num_samples = uint((dur / 1000.0) * sr);
+	a.data.resize(num_samples);
+	float period = sr / float(freq);
+	float half_period = period / 2;
+
+	for (uint t = 0; t < num_samples; t++) {
+		float pos_in_period = float(t % uint(period));
+		if (pos_in_period < half_period) {
+			a.data[t] = 2.0 * amp * (pos_in_period / half_period) - amp;
+		} else {
+			a.data[t] = 2.0 * amp * (1.0 - (pos_in_period - half_period) / half_period) - amp;
+		}
+	}
+
+	return @ a;
+}
