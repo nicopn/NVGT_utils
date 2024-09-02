@@ -38,60 +38,39 @@ If progress is at 0, the start value is returned. If it is at 1, the end value i
 funcdef double interpolator(double start, double end, double progress);
 
 /*
-_fade_lin, _fade_eqp, etc.
-Internal functions used with the fade_curves dictionary to interpolate between two values with different curves
+interp_lin, interp_eqp, etc.
+functions used to interpolate between two values with different curves
 See Interpolator for a description of their signatures
 */
-double _fade_lin(double s, double e, double t) {
+double interp_lin(double s, double e, double t) {
 	return s + t * (e - s);
 }
-double _fade_eqp(double s, double e, double t) {
+double interp_eqp(double s, double e, double t) {
 	return sqrt(_fade_lin(s ** 2, e ** 2, t));
 }
 
-double _fade_exp(double s, double e, double t) {
+double interp_exp(double s, double e, double t) {
 	return s + (e - s) * (1.0 - e **t);
 }
-/*
-dictionary fade_curves
-Maps strings (keys) to interpolation functions (values) for use with the fade function
-To add a fade curve to the dictionary, make a function compatible with the interpolator funcdef, and add it to this dictionary with a unique key
-*/
-dictionary fade_curves = {
-	{"lin",@ _fade_lin},
-	{"eqp",@ _fade_eqp},
-	{"exp",@ _fade_exp}
-};
 
 /*
-void fade(sound@ handle, double end volume, uint duration, string curve="exp")
+void fade(sound@ handle, double end volume, uint duration, interpolator@curve = interp_exp)
 Fades a sound object to a given volume over a specified duration and with a given fade curve
 
 parameters:
 sound@ handle: Handle to the sound object to perform fading on
 double end_volume: The volume of the sound object at the end of the fade (DBFS)
 uint duration: How long the fade takes to complete (ms
-string curve: Describes the shape of the fade. This value will be looked up in the fade_curves dictionary, and an error message will be shown if it couldn't be found.
+interpolator@ curve: Describes the shape of the fade
 
 */
-void fade(sound@ handle, double end_volume, uint duration, string curve = "exp") {
+void fade(sound@ handle, double end_volume, uint duration, interpolator@ curve=interp_exp) {
 	double s = 10.0 **(double(handle.volume) / 20.0);
 	double e = 10.0 **(end_volume / 20.0);
-	interpolator@ c;
-	if (!fade_curves.exists(curve)) {
-		alert("Error", "fade curve " + curve + " could not be found");
-		handle.volume = end_volume;
-		return;
-	}
-	if (!fade_curves.get(curve,@ c)) {
-		alert("Error", curve + " fade curve could not be retrieved");
-		handle.volume = end_volume;
-		return;
-	}
-
+	
 	timer t;
 	while (t.elapsed < duration) {
-		handle.volume = log10(c(s, e, double(t.elapsed) / double(duration))) * 20;
+		handle.volume = log10(curve(s, e, double(t.elapsed) / double(duration))) * 20;
 		wait(5);
 	}
 }
@@ -293,6 +272,9 @@ class audio {
 
 	returns:
 	A handle to an audio object containing the repeated data
+
+	Remarks:
+	This method overloads the * opperator
 	*/
 	audio@ opMul(uint times) {
 		audio a;
